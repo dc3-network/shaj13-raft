@@ -40,6 +40,8 @@ func TestMsgBus(t *testing.T) {
 
 	unsubscribe := func(s *Subscription) {
 		s.Unsubscribe()
+		m.mu.Lock()
+		defer m.mu.Unlock()
 		assert.Equal(t, len(m.events[s.eid]), 0)
 		assert.Equal(t, len(m.events), 1)
 	}
@@ -72,4 +74,58 @@ func TestMsgBus(t *testing.T) {
 	)
 
 	unsubscribe(s2)
+}
+
+// A once subscription leaves the bus with the broadcast that delivers it, so a
+// second broadcast cannot deliver it again. It used to stay until its publish
+// goroutine unsubscribed it, and TestMsgBus saw two deliveries.
+func TestSubscribeOnceLeavesWithTheFirstBroadcast(t *testing.T) {
+	m := New()
+	defer m.Close()
+
+	s := m.SubscribeOnce(1)
+	other := m.Subscribe(1)
+	m.Broadcast(1, "first")
+
+	m.mu.Lock()
+	_, onceLeft := m.events[1][s.id]
+	_, otherLeft := m.events[1][other.id]
+	m.mu.Unlock()
+	assert.False(t, onceLeft, "once subscription still subscribed after a broadcast")
+	assert.True(t, otherLeft, "regular subscription dropped by a broadcast")
+
+	// one goroutine publishes to every subscriber in turn: drain each value
+	// before the next broadcast, or a full channel blocks the others.
+	assert.Equal(t, "first", <-s.Chan())
+	assert.Equal(t, "first", <-other.Chan())
+	m.Broadcast(1, "second")
+	assert.Equal(t, "second", <-other.Chan())
+	<-s.closed // its publish has unsubscribed it
+	select {
+	case v := <-s.Chan():
+		t.Fatalf("once subscription delivered twice, second value %v", v)
+	default:
+	}
+}
+
+// A subscription can be deleted twice: a once subscription's publish
+// unsubscribes it, then its owner's deferred Unsubscribe runs (the engine does
+// both). The second delete must not drop another subscription to the same
+// event, here a LinearizableRead waiting for the same index.
+func TestUnsubscribeTwiceKeepsOtherSubscriptions(t *testing.T) {
+	m := New()
+	defer m.Close()
+
+	first := m.SubscribeOnce(1)
+	first.Unsubscribe()
+	second := m.SubscribeOnce(1)
+	first.Unsubscribe()
+
+	m.Broadcast(1, "value")
+	select {
+	case v := <-second.Chan():
+		assert.Equal(t, "value", v)
+	case <-time.After(5 * time.Second):
+		t.Fatal("subscription dropped by another subscription's second Unsubscribe")
+	}
 }
