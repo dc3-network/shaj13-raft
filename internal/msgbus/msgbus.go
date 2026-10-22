@@ -80,9 +80,18 @@ func (m *MsgBus) broadcast(id uint64, v interface{}) {
 	sv := make([]*Subscription, len(subs)) // subscription value
 	index := 0
 
-	for _, v := range subs {
+	for sid, v := range subs {
 		sv[index] = v
 		index++
+		// a once subscription gets this event only: drop it now, under m.mu,
+		// so another broadcast cannot pick it up before publish unsubscribes it.
+		if v.once {
+			delete(subs, sid)
+		}
+	}
+
+	if len(subs) == 0 {
+		delete(m.events, id)
 	}
 
 	go func(subs []*Subscription, v interface{}) {
@@ -121,6 +130,12 @@ func (m *MsgBus) delete(id, sid uint64) {
 
 	subs, ok := m.events[id]
 	if !ok {
+		return
+	}
+
+	// a subscription can be deleted twice (a once subscription's publish, then
+	// its owner's Unsubscribe): the second time, leave the others alone.
+	if _, ok := subs[sid]; !ok {
 		return
 	}
 
